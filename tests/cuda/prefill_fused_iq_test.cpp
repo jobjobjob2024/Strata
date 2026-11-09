@@ -13,7 +13,9 @@
 // different expert ranges.  Part 2 (timing): one layer at the engine's chunks (2048, 3584, 8192 tokens; 512 experts,
 // top 10) on both paths and on MMQ's products alone (no gathers), for the IQ2_XS, IQ3_XXS and IQ3_S packs' most
 // common layers, with the grouping checked and a sample of rows against the reference.  --no-ref, --no-timing,
-// --only=NAME, --chunks=A,B.  Exit 77 without a CUDA device of sm_80 or newer.
+// --only=NAME, --chunks=A,B, --unset-pf-fused (STRATA_PF_FUSED left unset instead of set to 1: the engine's default, for the
+// STRATA_PF_FUSED_Q2N=1 ctest entry).  Exit 77 without a CUDA device of sm_80 or newer.
+#include "strata/core/emulate.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
@@ -78,6 +80,15 @@ struct Geo {
 };
 
 // random blocks with a sane fp16 scale `d` at each block's start (every format here begins with it): scales chosen so
+// STRATA_PF_F16=1: the covered formats run on F16 weights (moe_f16_kq.cu, native_f16_kernel), not the int8 kernels
+bool f16_on() {
+    const char* v = std::getenv("STRATA_PF_F16");
+    // STRATA_PF_FUSED_F16=1 / STRATA_PF_FUSED_WS=1 (the int8 kernels' f16 mma form, #3779): F16 products too, so the same limits
+    const char* f = std::getenv("STRATA_PF_FUSED_F16");
+    const char* w = std::getenv("STRATA_PF_FUSED_WS");
+    return (v != nullptr && v[0] == '1') || (f != nullptr && f[0] == '1') || (w != nullptr && w[0] == '1');
+}
+
 // that the weights' typical size is that of a 2-3 bit expert (a few hundredths)
 void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt19937& rng) {
     const size_t bs = ggml_type_size(t), nb = (size_t) rows * (size_t) (cols / ggml_blck_size(t));
@@ -300,8 +311,7 @@ std::vector<int32_t> download_i(const Dev& d, size_t n) {
 }
 
 // part 1: against the double-precision reference
-void reference_part(const Pair& p, cudaStream_t s) {
-    constexpr int T = 256, E = 64, ZERO = 77;
+void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int ZERO = 77) {
     const Geo geo(p);
     std::mt19937 rng(136 + (unsigned) p.gu * 7 + (unsigned) p.d);
     std::vector<std::vector<uint8_t>> host((size_t) E);
@@ -315,7 +325,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
         blob[(size_t) e] = q;
     }
     const std::vector<float> x = make_x(T, rng, ZERO);
-    const std::vector<int32_t> ids = make_ids(T, E, rng, 2, 4);   // experts 0, 1 hot (several tiles), 60-63 unused
+    const std::vector<int32_t> ids = make_ids(T, E, rng, 2, E >= 64 ? 4 : 4);   // experts 0, 1 hot (several tiles), the last 4 unused
     const int64_t rows = (int64_t) T * K;
     const Routing r = sort_rows(ids, E);
     std::printf("%s - reference part: %d tokens, %d experts, rows per expert: max %d, experts without rows %d\n", p.name,
@@ -335,7 +345,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
     ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
     ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");   // an unwritten row is NaN
     ck(cudaDeviceSynchronize(), "uploads");
-    run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, 20, E}, blob, s);
+    run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, std::min(20, E - 1), E}, blob, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y_mmq = mq ? download(mbp->dm, (size_t) rows * N) : std::vector<float>((size_t) rows * N, 0.0f),
                              y_f = download(fb.dm, (size_t) rows * N);
@@ -397,13 +407,15 @@ void reference_part(const Pair& p, cudaStream_t s) {
     const Err e2 = compare(y_f, frow, ref2, pair, (size_t) rows);
     std::printf("  fused vs the int8-rounded model (same activation / H rounding, double sums): rel RMS %.3e  worst %.3e\n",
                 e2.rms, e2.worst);
-    if (e2.rms > 2e-3 || e2.worst > 3e-2)
+    // STRATA_PF_F16=1: H's int8 rounding meets values a few F16 ulps from the int8 model's (f16_on); the FP32 reference
+    // checks below stay as they are
+    if (e2.rms > (f16_on() ? 5e-3 : 2e-3) || e2.worst > 3e-2)
         throw std::runtime_error(std::string(p.name) + ": the fused path differs from its own arithmetic's model");
     if (mq) std::printf("  MMQ   vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", em.rms, em.worst);
     std::printf("  fused vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", ef.rms, ef.worst);
     if (mq) std::printf("  fused vs MMQ           : rel RMS %.3e  worst row max rel %.3e\n", efm.rms, efm.worst);
     double zmax = 0;
-    for (int k = 0; k < K; ++k)
+    for (int k = 0; k < K && ZERO >= 0; ++k)
         for (int o = 0; o < N; ++o)
             zmax = std::max(zmax, (double) std::fabs(y_f[(size_t) slot[(size_t) (ZERO * K + k)] * N + o]));
     if (zmax != 0) throw std::runtime_error(std::string(p.name) + ": the all-zero token's outputs are not zero");
@@ -418,7 +430,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
 
 // part 2: one layer at a real chunk, timed
 void timing_part(const Pair& p, int T, cudaStream_t s) {
-    constexpr int E = 512;
+    static const int E = [] { const char* v = std::getenv("S20_E"); return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : 512; }();   // S20_E=256: the Coder pack
     const Geo geo(p);
     std::mt19937 rng(1360);
     const int64_t rows = (int64_t) T * K;
@@ -626,21 +638,52 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     cudaEventDestroy(a);
     cudaEventDestroy(b);
     delete mbp;
-    if (efm.rms > 0.05) throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
+    // the two int8 paths at the real shape, every tile of the layer: R9700 rel RMS 1.3-1.9e-4, worst row 2.9e-3-8.3e-3
+    // (STRATA_PF_F16=1: F16 products against MMQ's int8, gfx1151 rel RMS 2.5-2.7e-3, worst row 6.4e-3-8.8e-3)
+    if (mq && !no_mmq && (efm.rms > (f16_on() ? 5e-3 : 1e-3) || efm.worst > 2e-2))
+        throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
 }
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
+        // --unset-pf-fused: STRATA_PF_FUSED unset, as the engine's default (the ctest entry for the opt-in STRATA_PF_FUSED_Q2N=1,
+        // whose Q2_0 / Q2_0 pair the engine takes with the old variable unset or at 1)
+        bool unset_pf = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--unset-pf-fused") == 0) unset_pf = true;
 #ifdef _WIN32
-        _putenv_s("STRATA_PF_FUSED", "1");
+        if (unset_pf) _putenv_s("STRATA_PF_FUSED", ""); else _putenv_s("STRATA_PF_FUSED", "1");   // (an empty value removes it)
 #else
-        setenv("STRATA_PF_FUSED", "1", 1);
+        if (unset_pf) unsetenv("STRATA_PF_FUSED"); else setenv("STRATA_PF_FUSED", "1", 1);
         setenv("STRATA_PF_FUSED_KQ", "1", 1);   // (the HIP build's Q4_K / Q5_K / Q5_1 / Q8_0 pairs)
+        setenv("STRATA_PF_FUSED_Q50", "1", 1);  // (gfx12's Q5_0 down pairs)
 #endif
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
-        if (!fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
+        // gfx12: only the native kernels exist (fused::available() is the Q2_0 pack's), so they decide there
+        if (!fused::available() && !fused::native_supported(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL)) {
+            std::printf("the fused kernels need sm_80 or newer (or gfx11 / gfx12 matrix cores): skipped\n");
+            return 77;
+        }
+        // with STRATA_PF_FUSED unset nothing is set up below sm_80 (Turing's pair is STRATA_PF_FUSED=1 STRATA_PF_FUSED_SM75=1's)
+        if (unset_pf) {
+            int major = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+            if (strata::cc_major_of(major) < 8) { std::printf("STRATA_PF_FUSED unset: nothing is set up below sm_80 (skipped)\n"); return 77; }
+        }
+        // the opt-in kernel sets (STRATA_PF_FUSED_NT=256, _F16=1, _WS=1): a card that cannot set them up (shared memory,
+        // occupancy) falls back to the 512-thread kernels, and a run of those would pass for the wrong kernels - skip it
+        {
+            const char* nt = std::getenv("STRATA_PF_FUSED_NT");
+            const char* f16 = std::getenv("STRATA_PF_FUSED_F16");
+            const char* ws = std::getenv("STRATA_PF_FUSED_WS");
+            const bool asked = (nt && std::atoi(nt) == 256) || (f16 && f16[0] == '1') || (ws && ws[0] == '1');
+            if (asked && !fused::native_wide()) {
+                std::printf("STRATA_PF_FUSED_NT / _F16 / _WS: those kernels are not set up on this device (skipped)\n");
+                return 77;
+            }
+        }
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
         const std::vector<Pair> pairs = {
             {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
@@ -648,7 +691,14 @@ int main(int argc, char** argv) {
             {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, "IQ3_S / IQ4_NL"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"},
             // (HIP only) UD-Q4_K_XL's: 47 layers Q4_K / Q5_1, 4 Q4_K / Q8_0, and the one Q5_K layer
             {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},         {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
-            {GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, "Q5_K / Q5_1"},         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"}};
+            {GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, "Q5_K / Q5_1"},         {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"},
+            // the Coder IQ1_M pack's other pairs (appended: the default timing set takes pairs 0, 1, 4, 3 by index)
+            {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"},   {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, "IQ3_XXS / Q2_0"},
+            {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"},
+            // UD-IQ4_XS-v31's Q5_0 down layers (HIP gfx12, STRATA_PF_FUSED_Q50=1; checked against the reference, the build has no Q5_0 MMQ)
+            {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, "IQ3_XXS / Q5_0"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, "IQ4_XS / Q5_0"},
+            // the canonical Q2_0 pack (gate/up and down Q2_0; CUDA)
+            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -670,14 +720,30 @@ int main(int argc, char** argv) {
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         for (const Pair& p : pairs) {
             if (only ? std::string(p.name).find(only) == std::string::npos : p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K) continue;
-            if (!fused::native_supported((int) p.gu, (int) p.d))
+            if (!fused::native_supported((int) p.gu, (int) p.d)) {
+                // the Q2_0 / Q2_0 pair is the Turing opt-in's (STRATA_PF_FUSED_SM75=1; the only pair set up there) or, on sm_80+,
+                // STRATA_PF_FUSED_Q2N=1's: skip what this device does not take (--only=NAME still insists)
+                const bool turing_pair = p.gu == GGML_TYPE_Q2_0 && p.d == GGML_TYPE_Q2_0;
+                const bool q50_pair = p.d == GGML_TYPE_Q5_0;   // (gfx12 / gfx1151 only: the CUDA kernels have no Q5_0 down)
+                int major = 0;
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+                if ((major < 8 || turing_pair || q50_pair) && !only) { std::printf("%s: not set up on this device (skipped)\n", p.name); continue; }
                 throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
+            }
             if (ref) reference_part(p, s);
+            // Q5_0 down (round 0217): tails and boundaries - a handful of tokens, one token, a tile's edge (63, 65 rows an expert is not controlled, the counts follow the routing)
+            if (ref && p.d == GGML_TYPE_Q5_0) {
+                reference_part(p, s, 33, 16, 5);
+                reference_part(p, s, 1, 16, -1);
+                reference_part(p, s, 130, 32, 77);
+                reference_part(p, s, 517, 32, 300);
+            }
         }
         if (timing) {
             // the IQ2_XS pack's layers (34 of 48 IQ2_S / Q2_0, 11 IQ2_XXS / Q2_0), the IQ3_S pack's most common, IQ3_XXS's
             for (const Pair& p : only ? pairs : std::vector<Pair>{pairs[0], pairs[1], pairs[4], pairs[3]}) {
                 if (only && std::string(p.name).find(only) == std::string::npos) continue;
+                if (!fused::native_supported((int) p.gu, (int) p.d)) continue;   // (Turing: the Q2_0 pair only)
                 for (int T : chunks) timing_part(p, T, s);
             }
         }
